@@ -9,6 +9,7 @@ from scipy.io.wavfile import write
 from env import AttrDict
 from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 from models import Generator
+import soundfile as sf
 
 h = None
 device = None
@@ -21,11 +22,6 @@ def load_checkpoint(filepath, device):
     print("Complete.")
     return checkpoint_dict
 
-
-def get_mel(x):
-    return mel_spectrogram(x, h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax)
-
-
 def scan_checkpoint(cp_dir, prefix):
     pattern = os.path.join(cp_dir, prefix + '*')
     cp_list = glob.glob(pattern)
@@ -34,32 +30,76 @@ def scan_checkpoint(cp_dir, prefix):
     return sorted(cp_list)[-1]
 
 
-def inference(a):
+
+
+def get_mel(wav):
+    """Convert waveform to Mel-spectrogram."""
+    # Ensure audio is at the correct sample rate
+    if h.sampling_rate != 22050:
+        print(f"Warning: Model expects {h.sampling_rate}Hz audio")
+    
+    # Normalize audio to [-1, 1]
+    wav = wav / max(abs(wav.min()), abs(wav.max()))
+    
+    mel = mel_spectrogram(wav, h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax)
+    print(f"Initial mel shape: {mel.shape}")
+    
+    # Convert to tensor and reshape
+    mel = torch.FloatTensor(mel)
+    mel = mel.squeeze(1)  # Remove the unnecessary dimension
+    mel = mel.unsqueeze(0)  # Add batch dimension
+    
+    print(f"Final mel shape: {mel.shape}")
+    return mel
+
+def inference(args, config_file):
+    """Run inference for HiFi-GAN."""
+    # Load the config from the config file
+    with open(config_file) as f:
+        config = json.load(f)
+    global h
+    h = AttrDict(config)
+    
     generator = Generator(h).to(device)
-
-    state_dict_g = load_checkpoint(a.checkpoint_file, device)
+    state_dict_g = load_checkpoint(args.checkpoint_file, device)
     generator.load_state_dict(state_dict_g['generator'])
-
-    filelist = os.listdir(a.input_wavs_dir)
-
-    os.makedirs(a.output_dir, exist_ok=True)
-
     generator.eval()
     generator.remove_weight_norm()
-    with torch.no_grad():
-        for i, filname in enumerate(filelist):
-            wav, sr = load_wav(os.path.join(a.input_wavs_dir, filname))
-            wav = wav / MAX_WAV_VALUE
-            wav = torch.FloatTensor(wav).to(device)
-            x = get_mel(wav.unsqueeze(0))
-            y_g_hat = generator(x)
-            audio = y_g_hat.squeeze()
-            audio = audio * MAX_WAV_VALUE
-            audio = audio.cpu().numpy().astype('int16')
 
-            output_file = os.path.join(a.output_dir, os.path.splitext(filname)[0] + '_generated.wav')
-            write(output_file, h.sampling_rate, audio)
-            print(output_file)
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Iterate through all WAV files in the input directory
+    wav_files = glob.glob(os.path.join(args.input_wavs_dir, '*.wav'))
+    for wav_path in wav_files:
+        print(f"Processing {wav_path}")
+        wav, sr = sf.read(wav_path)
+        
+        # Resample if necessary
+        if sr != h.sampling_rate:
+            print(f"Resampling from {sr} to {h.sampling_rate}")
+            from librosa import resample
+            wav = resample(y=wav, orig_sr=sr, target_sr=h.sampling_rate)
+        
+        wav = torch.FloatTensor(wav).unsqueeze(0).to(device)
+
+        # Generate Mel-spectrogram
+        mel = get_mel(wav)
+
+        # Pass the Mel-spectrogram through the generator
+        with torch.no_grad():
+            y_g_hat = generator(mel)
+
+        # Save the generated audio
+        y_g_hat = y_g_hat.squeeze().cpu().numpy()
+        
+        # Normalize output audio
+        y_g_hat = y_g_hat / max(abs(y_g_hat.min()), abs(y_g_hat.max()))
+
+        # Save the output WAV file
+        output_path = os.path.join(args.output_dir, os.path.basename(wav_path))
+        sf.write(output_path, y_g_hat, h.sampling_rate)
+        print(f"Saved to {output_path}")
 
 
 def main():
@@ -72,6 +112,7 @@ def main():
     a = parser.parse_args()
 
     config_file = os.path.join(os.path.split(a.checkpoint_file)[0], 'config.json')
+
     with open(config_file) as f:
         data = f.read()
 
@@ -82,14 +123,15 @@ def main():
     torch.manual_seed(h.seed)
     global device
     if torch.cuda.is_available():
+        print('Using GPU.')
         torch.cuda.manual_seed(h.seed)
         device = torch.device('cuda')
     else:
+        print('Using CPU.')
         device = torch.device('cpu')
 
-    inference(a)
+    inference(a, config_file)
 
 
 if __name__ == '__main__':
     main()
-
